@@ -1,0 +1,142 @@
+import torch, pandas as pd, numpy as np, xgboost as xgb, warnings, gc, shap
+import torch.nn as nn, torch.nn.functional as F
+import torch.optim as optim
+from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score, classification_report
+from sklearn.linear_model import LogisticRegression
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+warnings.filterwarnings("ignore")
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+SEED = 42; np.random.seed(SEED); torch.manual_seed(SEED)
+
+# ==================== 1️⃣ HYBRID ARCHITECTURE (TRANSFORMER + BI-LSTM) ====================
+
+class HybridBlock(nn.Module):
+    def __init__(self, input_dim, hidden=512, heads=8):
+        super().__init__()
+        self.lstm = nn.LSTM(input_dim, hidden // 2, bidirectional=True, batch_first=True)
+        self.attn = nn.MultiheadAttention(hidden, heads, batch_first=True)
+        self.norm = nn.LayerNorm(hidden)
+        self.ffn = nn.Sequential(nn.Linear(hidden, hidden*2), nn.ReLU(), nn.Linear(hidden*2, hidden))
+
+    def forward(self, x):
+        h_lstm, _ = self.lstm(x)
+        # نأخذ الـ weights للتفسير
+        attn_out, weights = self.attn(h_lstm, h_lstm, h_lstm)
+        x = self.norm(h_lstm + attn_out)
+        return x + self.ffn(x), weights
+
+class QuadTask_Sovereign_Model(nn.Module):
+    def __init__(self, input_dim, hidden=512, n_layers=4):
+        super().__init__()
+        self.embedding = nn.Linear(input_dim, hidden)
+        self.layers = nn.ModuleList([HybridBlock(hidden, hidden) for _ in range(n_layers)])
+        self.h_now = nn.Linear(hidden, 3)
+        self.h_1y = nn.Linear(hidden, 3)
+        self.h_2y = nn.Linear(hidden, 3)
+        self.h_3y = nn.Linear(hidden, 3)
+
+    def forward(self, x):
+        x = self.embedding(x)
+        last_weights = None
+        for layer in self.layers:
+            x, last_weights = layer(x)
+        context = torch.mean(x, dim=1)
+        return self.h_now(context), self.h_1y(context), self.h_2y(context), self.h_3y(context), context, last_weights
+
+# ==================== 2️⃣ DATA ENGINE ====================
+
+def prepare_v33_data(path, seq_len=15):
+    print("📦 Phase 1: Heavy Alignment & Data Preparation...")
+    df = pd.read_csv(path).sort_values(['RID','Years_bl']).fillna(0)
+    feats = ['MMSE','ADAS13','CDRSB','FAQ','Hippocampus','WholeBrain'] + [c for c in df.columns if 'DTI' in c]
+    
+    scaler = StandardScaler()
+    df[feats] = scaler.fit_transform(df[feats])
+    
+    X, Y = [], []
+    for rid in df["RID"].unique():
+        p = df[df["RID"]==rid]
+        if len(p) < 5: continue
+        x_raw = p[feats].values
+        X.append(np.pad(x_raw[:-4], ((seq_len - len(x_raw[:-4]), 0), (0, 0)), mode='constant') if len(x_raw[:-4])<seq_len else x_raw[-seq_len-4:-4])
+        Y.append([int(p['DX_num'].iloc[-4]), int(p['DX_num'].iloc[-3]), int(p['DX_num'].iloc[-2]), int(p['DX_num'].iloc[-1])])
+
+    X, Y = np.array(X), np.array(Y)
+    X_aug = np.concatenate([X, X + np.random.normal(0, 0.01, X.shape)], axis=0)
+    Y_aug = np.concatenate([Y, Y], axis=0)
+    return train_test_split(X_aug, Y_aug, test_size=0.15, random_state=SEED), feats
+
+# ==================== 3️⃣ MASTER EXECUTION & XAI VISUALIZATION ====================
+
+def run_v33_system(path):
+    (X_tr, X_te, Y_tr, Y_te), f_cols = prepare_v33_data(path)
+    model = QuadTask_Sovereign_Model(len(f_cols)).to(device)
+    optimizer = optim.AdamW(model.parameters(), lr=0.0001)
+
+    print(f"🚀 Phase 2: Training Hybrid Transformer-LSTM Super-Model...")
+    for epoch in range(1, 101):
+        model.train(); optimizer.zero_grad()
+        n, f1, f2, f3, _, _ = model(torch.tensor(X_tr, dtype=torch.float32).to(device))
+        loss = F.cross_entropy(n, torch.tensor(Y_tr[:,0]).to(device)) + \
+               0.4 * (F.cross_entropy(f1, torch.tensor(Y_tr[:,1]).to(device)) + 
+                      F.cross_entropy(f2, torch.tensor(Y_tr[:,2]).to(device)) + 
+                      F.cross_entropy(f3, torch.tensor(Y_tr[:,3]).to(device)))
+        loss.backward(); optimizer.step()
+
+    model.eval()
+    with torch.no_grad():
+        p_n_tr, p_1_tr, p_2_tr, p_3_tr, emb_tr, _ = model(torch.tensor(X_tr, dtype=torch.float32).to(device))
+        p_n_te, p_1_te, p_2_te, p_3_te, emb_te, attn_w = model(torch.tensor(X_te, dtype=torch.float32).to(device))
+
+    print("🌲 Phase 3: Training XGBoost & SHAP Interpretation...")
+    xgb_mod = xgb.XGBClassifier(n_estimators=1000, max_depth=8, tree_method='hist')
+    xgb_mod.fit(emb_tr.cpu().numpy(), Y_tr[:,0])
+    
+    # SHAP Explainer
+    explainer = shap.TreeExplainer(xgb_mod)
+    shap_values = explainer.shap_values(emb_te.cpu().numpy())
+
+    # Meta-Ensemble
+    m_tr = np.hstack([F.softmax(p_n_tr, dim=1).cpu().numpy(), xgb_mod.predict_proba(emb_tr.cpu().numpy())])
+    m_te = np.hstack([F.softmax(p_n_te, dim=1).cpu().numpy(), xgb_mod.predict_proba(emb_te.cpu().numpy())])
+    stacker = LogisticRegression().fit(m_tr, Y_tr[:,0])
+    final_preds = stacker.predict(m_te)
+
+    # Output Accuracy Results
+    print("\n" + "═"*60 + "\n🎯 MULTI-MODEL DIAGNOSIS ACCURACY (PRESENT DAY)\n" + "═"*60)
+    print(f"Hybrid Transformer-LSTM: {accuracy_score(Y_te[:,0], np.argmax(p_n_te.cpu().numpy(), axis=1))*100:.2f}%")
+    print(f"XGBoost Base:           {accuracy_score(Y_te[:,0], xgb_mod.predict(emb_te.cpu().numpy()))*100:.2f}%")
+    print(f"SUPER-ENSEMBLE FINAL:    {accuracy_score(Y_te[:,0], final_preds)*100:.2f}%")
+
+    # --- 📈 THE XAI DASHBOARD (SHAP + ATTENTION) ---
+    print("\n🎨 Phase 4: Generating Global & Local Explanations...")
+    
+    # 1. Global Feature Importance (SHAP Summary)
+    plt.figure(figsize=(10, 6))
+    shap.summary_plot(shap_values, emb_te.cpu().numpy(), plot_type="bar", show=False)
+    plt.title("Global Feature Importance (SHAP - Neural Embeddings)")
+    plt.show()
+
+    # 2. Local Patient Pathway + Attention
+    p_idx = np.random.randint(0, len(X_te))
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(18, 6))
+    
+    journey = [final_preds[p_idx], np.argmax(p_1_te[p_idx].cpu().numpy()), 
+               np.argmax(p_2_te[p_idx].cpu().numpy()), np.argmax(p_3_te[p_idx].cpu().numpy())]
+    ax1.plot(["Now", "+1Y", "+2Y", "+3Y"], journey, marker='o', linewidth=4, color='#2c3e50', markerfacecolor='#e74c3c')
+    ax1.set_title(f"Patient Prognosis Pathway (Patient ID: {p_idx})", fontsize=14)
+    ax1.set_yticks([0, 1, 2]); ax1.set_yticklabels(['CN (Healthy)', 'MCI', 'AD (Dementia)'])
+    ax1.grid(True, linestyle='--', alpha=0.7)
+
+    sns.heatmap(attn_w[p_idx].cpu().numpy()[:15, :15], cmap='viridis', ax=ax2, annot=False)
+    ax2.set_title("Temporal Attention: Which past visits influenced the decision?", fontsize=14)
+    plt.tight_layout()
+    plt.show()
+
+    print(f"\n✅ SHAP & Attention plots generated successfully. Ready for Thesis/Paper inclusion.")
+
+run_v33_system("ADNI_Final_Clean_Ready.csv")
