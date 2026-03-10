@@ -2,9 +2,9 @@ import torch, pandas as pd, numpy as np, xgboost as xgb, warnings, gc, os
 import torch.nn as nn, torch.nn.functional as F
 import torch.optim as optim
 from torch_geometric.nn import GATv2Conv, GraphNorm
-from sklearn.preprocessing import RobustScaler
+from sklearn.preprocessing import RobustScaler, label_binarize
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import accuracy_score, confusion_matrix
+from sklearn.metrics import accuracy_score, confusion_matrix, roc_curve, auc
 import matplotlib.pyplot as plt
 import seaborn as sns
 import shap 
@@ -16,22 +16,34 @@ device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 SEED = 42; np.random.seed(SEED); torch.manual_seed(SEED)
 gc.collect(); torch.cuda.empty_cache()
 
-# ==================== 1️⃣ الهياكل العصبية (Architecture) ====================
+# ==================== 🧠 KAN-Inspired Layer ====================
+class KANLayer(nn.Module):
+    def __init__(self, in_features, out_features):
+        super().__init__()
+        self.base_linear = nn.Linear(in_features, out_features)
+        self.spline_weight = nn.Parameter(torch.randn(out_features, in_features) * 0.1)
+        
+    def forward(self, x):
+        base = self.base_linear(x)
+        nonlinear = F.silu(x) @ self.spline_weight.t()
+        return base + nonlinear
+
+# ==================== 1️⃣ الهياكل العصبية (KAN-Enhanced Architecture) ====================
 
 class DeepMetaFusion(nn.Module):
     def __init__(self, input_dim):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(input_dim, 128),
+            KANLayer(input_dim, 128),
             nn.BatchNorm1d(128),
-            nn.ReLU(),
-            nn.Linear(128, 64),
-            nn.ReLU(),
+            nn.SiLU(),
+            KANLayer(128, 64),
+            nn.SiLU(),
             nn.Linear(64, 3)
         )
     def forward(self, x): return self.net(x)
 
-class BrainSovereign_Final(nn.Module):
+class BrainSovereign_KAN(nn.Module):
     def __init__(self, input_dim, hidden=512, n_layers=6):
         super().__init__()
         self.gnn = GATv2Conv(input_dim, hidden // 4, heads=4, dropout=0.4)
@@ -39,7 +51,8 @@ class BrainSovereign_Final(nn.Module):
         self.lstm = nn.LSTM(hidden, hidden // 2, bidirectional=True, batch_first=True, dropout=0.4)
         encoder_layer = nn.TransformerEncoderLayer(d_model=hidden, nhead=8, dim_feedforward=2048, batch_first=True, dropout=0.4)
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
-        self.heads = nn.ModuleList([nn.Linear(hidden, 3) for _ in range(4)])
+        self.temporal_attention = nn.Linear(hidden, 1)
+        self.heads = nn.ModuleList([KANLayer(hidden, 3) for _ in range(4)])
         self.register_buffer('fixed_edge_index', None)
 
     def forward(self, x):
@@ -49,37 +62,45 @@ class BrainSovereign_Final(nn.Module):
         x_gnn = self.gnn_norm(x_gnn).view(batch_size, seq_len, -1)
         x_lstm, _ = self.lstm(x_gnn)
         x_trans = self.transformer(x_lstm)
-        context = torch.mean(x_trans, dim=1)
+        weights = torch.softmax(self.temporal_attention(x_trans), dim=1)
+        context = torch.sum(weights * x_trans, dim=1)
         return [head(context) for head in self.heads], context
 
-    def build_structural_connectivity(self, x_avg):
+    def build_structural_connectivity(self, x_avg, top_k=4):
         with torch.no_grad():
             norm = x_avg.norm(dim=1, keepdim=True)
             sim = torch.mm(x_avg, x_avg.t()) / (torch.mm(norm, norm.t()) + 1e-8)
-            adj = (sim > 0.85).float() 
-            self.fixed_edge_index = adj.nonzero().t().contiguous()
+            edges = []
+            for i in range(sim.shape[0]):
+                idx = torch.topk(sim[i], k=top_k+1).indices[1:]
+                for j in idx: edges.append([i, j.item()])
+            self.fixed_edge_index = torch.tensor(edges).t().contiguous().to(device)
 
-# ==================== 2️⃣ معالجة البيانات (تحديث الميزات) ====================
+# ==================== 2️⃣ معالجة البيانات والتحليل الشامل ====================
 
 def prepare_data(path, seq_len=12):
-    print("🧬 Phase 1: Integrating Full Multimodal Features...")
+    print("🧬 Phase 1: Integrating Full Multimodal Features & Bio-Imaging...")
     df = pd.read_csv(path).sort_values(['RID','Years_bl']).fillna(0)
     
-    # --- قائمة الميزات الكاملة ---
+    # دمج قوائم الميزات من الكودين
     structural = ['Hippocampus', 'WholeBrain', 'Entorhinal', 'Ventricles', 'Fusiform', 'MidTemp', 'ICV']
     biomarkers = ['ABETA_UPENNBIOMK9_04_19_17', 'TAU_UPENNBIOMK9_04_19_17', 'PTAU_UPENNBIOMK9_04_19_17', 'AV45', 'FDG']
     cognitive = ['MMSE', 'ADAS13', 'ADAS11', 'CDRSB', 'FAQ', 'MOCA', 'RAVLT_immediate', 'RAVLT_learning', 'RAVLT_forgetting']
     demo = ['AGE', 'APOE4', 'PTEDUCAT', 'PTGENDER']
     dti_cols = [c for c in df.columns if 'DTI' in c]
     
-    # دمج الميزات والتأكد من وجودها في الملف
-    all_potential_feats = structural + biomarkers + cognitive + demo + dti_cols
-    feats = [f for f in all_potential_feats if f in df.columns]
-    
+    feats = [f for f in (structural + biomarkers + cognitive + demo + dti_cols) if f in df.columns]
     print(f"✅ Total Features Integrated: {len(feats)}")
-    
+
+    # Heatmap Correlation للبيانات السريرية
+    clin_cols = [c for c in ['MMSE','ADAS13','CDRSB','FAQ','Hippocampus','WholeBrain'] if c in df.columns]
+    plt.figure(figsize=(10, 8))
+    sns.heatmap(df[clin_cols].corr(), annot=True, cmap='RdBu_r', center=0)
+    plt.title("Clinical Feature Correlation Matrix")
+    plt.savefig("clinical_correlation.png")
+    plt.close()
+
     df[feats] = RobustScaler().fit_transform(df[feats])
-    
     X, Y = [], []
     for rid in df["RID"].unique():
         p = df[df["RID"]==rid]
@@ -89,23 +110,21 @@ def prepare_data(path, seq_len=12):
         Y.append([p['DX_num'].iloc[-4], p['DX_num'].iloc[-3], p['DX_num'].iloc[-2], p['DX_num'].iloc[-1]])
     
     X, Y = np.array(X), np.array(Y).astype(int)
-    
     from sklearn.utils import resample
     X_f, Y_f = [], []
     for cv in np.unique(Y[:, 0]):
-        count = min(pd.Series(Y[:, 0]).value_counts().max(), 500)
-        xf, yf = resample(X[Y[:,0]==cv], Y[Y[:,0]==cv], n_samples=count, random_state=SEED)
+        samples = min(pd.Series(Y[:, 0]).value_counts().max(), 500)
+        xf, yf = resample(X[Y[:,0]==cv], Y[Y[:,0]==cv], n_samples=samples, random_state=SEED)
         X_f.append(xf); Y_f.append(yf)
-    
     return train_test_split(np.vstack(X_f), np.vstack(Y_f), test_size=0.15, random_state=SEED), feats
 
-# ==================== 3️⃣ التشغيل والتحليل ====================
+# ==================== 3️⃣ التشغيل والتقرير النهائي ====================
 
-def run_ultimate_system_with_overfit_alert(path):
+def run_research_pipeline(path):
     (X_tr_full, X_te, Y_tr_full, Y_te), f_cols = prepare_data(path)
     X_train, X_val, Y_train, Y_val = train_test_split(X_tr_full, Y_tr_full, test_size=0.15, random_state=SEED)
     
-    model = BrainSovereign_Final(len(f_cols)).to(device)
+    model = BrainSovereign_KAN(len(f_cols)).to(device)
     avg_train_feats = torch.tensor(X_train, dtype=torch.float32).mean(dim=0).to(device)
     model.build_structural_connectivity(avg_train_feats)
     
@@ -113,10 +132,9 @@ def run_ultimate_system_with_overfit_alert(path):
     train_losses, val_losses = [], []
     best_val_loss, patience, trigger_times = float('inf'), 12, 0
 
-    print("🚀 Step 2: Training BioSync Core (Multimodal GNN Mode)...")
+    print("🚀 Step 2: Training BioSync KAN-Core...")
     for epoch in range(1, 151):
-        model.train()
-        optimizer.zero_grad()
+        model.train(); optimizer.zero_grad()
         x_t, y_t = torch.tensor(X_train, dtype=torch.float32).to(device), torch.tensor(Y_train).to(device)
         outs, _ = model(x_t)
         loss_train = sum([F.cross_entropy(outs[j], y_t[:,j], label_smoothing=0.1) for j in range(4)])
@@ -130,18 +148,18 @@ def run_ultimate_system_with_overfit_alert(path):
             loss_val = sum([F.cross_entropy(v_outs[j], y_v[:,j]) for j in range(4)])
             val_losses.append(loss_val.item())
 
-        if epoch % 10 == 0:
-            print(f"Epoch {epoch:03d} | Train Loss: {loss_train:.4f} | Val Loss: {loss_val:.4f}")
-
+        if epoch % 20 == 0: print(f"Epoch {epoch:03d} | Train Loss: {loss_train:.4f} | Val Loss: {loss_val:.4f}")
+        
+        # Early Stopping
         if loss_val < best_val_loss:
             best_val_loss = loss_val
-            torch.save(model.state_dict(), 'best_neuro_model.pth')
+            torch.save(model.state_dict(), 'best_kan_model.pth')
             trigger_times = 0
         else:
             trigger_times += 1
             if trigger_times >= patience: break
 
-    model.load_state_dict(torch.load('best_neuro_model.pth'))
+    model.load_state_dict(torch.load('best_kan_model.pth'))
     model.eval()
     with torch.no_grad():
         p_outs, emb_te = model(torch.tensor(X_te, dtype=torch.float32).to(device))
@@ -150,25 +168,27 @@ def run_ultimate_system_with_overfit_alert(path):
     horizons = ["Present", "12 Months", "24 Months", "36 Months"]
     final_stats = []
 
-    print("📊 Step 3: Generating SHAP Explanations & Reports...")
-
-    with PdfPages('Research_Visual_Report.pdf') as pdf:
+    print("📊 Step 3: Generating Visual Research Report (PDF)...")
+    with PdfPages('Alzheimer_KAN_Research_Report.pdf') as pdf:
+        # 1. Learning Curves
         plt.figure(figsize=(8, 5))
         plt.plot(train_losses, label='Train Loss', color='blue')
         plt.plot(val_losses, label='Val Loss', color='red', linestyle='--')
-        plt.title("Learning Dynamics: Full Feature Integration"); plt.legend(); plt.grid(True)
+        plt.title("Learning Dynamics: Loss Convergence"); plt.legend(); plt.grid(True)
         pdf.savefig(); plt.close()
 
         for i, name in enumerate(horizons):
-            xgb_mod = xgb.XGBClassifier(n_estimators=300, random_state=SEED).fit(emb_tr.cpu().numpy(), Y_tr_full[:,i])
+            # Statistical Expert + SHAP
+            xgb_mod = xgb.XGBClassifier(n_estimators=100, random_state=SEED).fit(emb_tr.cpu().numpy(), Y_tr_full[:,i])
             
+            # SHAP Summary
             explainer = shap.TreeExplainer(xgb_mod)
             shap_values = explainer.shap_values(emb_te.cpu().numpy())
-            
             plt.figure(figsize=(10, 6))
-            shap.summary_plot(shap_values, emb_te.cpu().numpy(), show=False, plot_size=None)
-            plt.title(f"SHAP Importance: {name} Prediction"); pdf.savefig(); plt.close()
+            shap.summary_plot(shap_values, emb_te.cpu().numpy(), show=False)
+            plt.title(f"SHAP Influence - {name} Forecast"); pdf.savefig(); plt.close()
 
+            # Meta-Fusion
             m_tr = np.hstack([F.softmax(p_outs_tr[i], dim=1).cpu().numpy(), xgb_mod.predict_proba(emb_tr.cpu().numpy())])
             m_te = np.hstack([F.softmax(p_outs[i], dim=1).cpu().numpy(), xgb_mod.predict_proba(emb_te.cpu().numpy())])
             
@@ -179,23 +199,38 @@ def run_ultimate_system_with_overfit_alert(path):
                 F.cross_entropy(meta_nn(torch.tensor(m_tr, dtype=torch.float32).to(device)), torch.tensor(Y_tr_full[:,i]).to(device)).backward()
                 m_opt.step()
             
-            y_fusion = torch.argmax(meta_nn(torch.tensor(m_te, dtype=torch.float32).to(device)), dim=1).cpu().numpy()
-            val_acc = accuracy_score(Y_te[:,i], y_fusion)
-            final_stats.append({'Horizon': name, 'Fusion_Acc': val_acc*100})
-
+            final_logits = meta_nn(torch.tensor(m_te, dtype=torch.float32).to(device))
+            final_probs = F.softmax(final_logits, dim=1).cpu().detach().numpy()
+            y_fusion = np.argmax(final_probs, axis=1)
+            
+            # Confusion Matrix
             plt.figure(figsize=(6, 5))
-            sns.heatmap(confusion_matrix(Y_te[:, i], y_fusion), annot=True, fmt='d', cmap='Blues', 
+            sns.heatmap(confusion_matrix(Y_te[:, i], y_fusion), annot=True, fmt='d', cmap='YlGnBu', 
                         xticklabels=['CN','MCI','AD'], yticklabels=['CN','MCI','AD'])
             plt.title(f"Confusion Matrix: {name}"); pdf.savefig(); plt.close()
 
-        df_results = pd.DataFrame(final_stats)
+            # ROC Curve
+            y_bin = label_binarize(Y_te[:, i], classes=[0, 1, 2])
+            plt.figure(figsize=(8, 6))
+            for c, c_name in enumerate(['CN', 'MCI', 'AD']):
+                fpr, tpr, _ = roc_curve(y_bin[:, c], final_probs[:, c])
+                plt.plot(fpr, tpr, label=f'{c_name} (AUC = {auc(fpr, tpr):.2f})')
+            plt.plot([0, 1], [0, 1], 'k--')
+            plt.title(f"ROC Performance: {name}"); plt.xlabel("FPR"); plt.ylabel("TPR"); plt.legend(); plt.grid(True)
+            pdf.savefig(); plt.close()
+
+            final_stats.append({'Horizon': name, 'Fusion_Acc': accuracy_score(Y_te[:,i], y_fusion)*100})
+
+        # Final Accuracy Summary
+        df_res = pd.DataFrame(final_stats)
         plt.figure(figsize=(10, 6))
-        plt.plot(df_results['Horizon'], df_results['Fusion_Acc'], marker='o', lw=3, color='green')
-        plt.title("BioSync System: 36-Month Accuracy Profile"); plt.ylabel("Accuracy %"); plt.grid(True)
+        sns.barplot(x='Horizon', y='Fusion_Acc', data=df_res, palette='magma')
+        plt.title("BioSync KAN System: Accuracy Profile (36 Months)"); plt.ylim(0, 105); plt.grid(axis='y')
         pdf.savefig(); plt.close()
 
     print("\n" + "="*50)
-    print(df_results)
+    print("✅ REPORT SAVED: Alzheimer_KAN_Research_Report.pdf")
+    print(df_res)
     print("="*50)
 
-run_ultimate_system_with_overfit_alert("ADNI_Final_Clean_Ready.csv")
+run_research_pipeline("ADNI_Final_Clean_Ready.csv")
