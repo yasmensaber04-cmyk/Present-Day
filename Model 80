@@ -1,0 +1,174 @@
+import torch, pandas as pd, numpy as np, xgboost as xgb, warnings, gc
+import torch.nn as nn, torch.nn.functional as F
+import torch.optim as optim
+from torch_geometric.nn import GATv2Conv, GraphNorm
+from sklearn.preprocessing import RobustScaler, label_binarize
+from sklearn.model_selection import StratifiedKFold
+from sklearn.metrics import (accuracy_score, balanced_accuracy_score, f1_score, 
+                             roc_auc_score, confusion_matrix)
+import matplotlib.pyplot as plt
+import seaborn as sns
+import shap
+from matplotlib.backends.backend_pdf import PdfPages
+from google.colab import files
+
+warnings.filterwarnings("ignore")
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+SEED = 42; np.random.seed(SEED); torch.manual_seed(SEED)
+
+# ==================== 1️⃣ الهياكل العصبية المتطورة (High-Capacity Architecture) ====================
+
+class DeepMetaFusion(nn.Module):
+    def __init__(self, input_dim):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, 128), # زيادة السعة لـ 128
+            nn.BatchNorm1d(128),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(128, 64),
+            nn.ReLU(),
+            nn.Linear(64, 3)
+        )
+    def forward(self, x): return self.net(x)
+
+class BrainSovereign_Master(nn.Module):
+    def __init__(self, input_dim, hidden=512, n_layers=6): # زيادة الطبقات لـ 6
+        super().__init__()
+        self.gnn = GATv2Conv(input_dim, hidden // 4, heads=4, dropout=0.4)
+        self.gnn_norm = GraphNorm(hidden)
+        self.lstm = nn.LSTM(hidden, hidden // 2, bidirectional=True, batch_first=True, dropout=0.4)
+        encoder_layer = nn.TransformerEncoderLayer(d_model=hidden, nhead=8, dim_feedforward=2048, batch_first=True, dropout=0.4)
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
+        self.heads = nn.ModuleList([nn.Linear(hidden, 3) for _ in range(4)])
+
+    def forward(self, x):
+        batch_size, seq_len, _ = x.shape
+        edge_index = self.get_region_adjacency(x).to(device)
+        x_flat = x.view(batch_size * seq_len, -1)
+        x_gnn = self.gnn(x_flat, edge_index)
+        x_gnn = self.gnn_norm(x_gnn).view(batch_size, seq_len, -1)
+        x_lstm, _ = self.lstm(x_gnn)
+        x_trans = self.transformer(x_lstm)
+        context = torch.mean(x_trans, dim=1)
+        return [head(context) for head in self.heads], context
+
+    def get_region_adjacency(self, x):
+        with torch.no_grad():
+            dist = torch.cdist(x[0].t(), x[0].t())
+            adj = (dist < dist.mean()).float()
+            return adj.nonzero().t().contiguous()
+
+# ==================== 2️⃣ المحرك الأساسي والتحقق (Core Engine) ====================
+
+def run_master_system(path):
+    print("📦 Loading Data & Auto-Detecting Features...")
+    df = pd.read_csv(path).sort_values(['RID','Years_bl']).fillna(0)
+    
+    # تحديد كافة الميزات (إكلينيكية، جينية، تصويرية)
+    dti_cols = [c for c in df.columns if 'DTI' in c]
+    # أضفت لكِ هنا الجينات والبيانات التعريفية الشائعة تلقائياً
+    core_feats = ['MMSE','ADAS13','CDRSB','FAQ','Hippocampus','WholeBrain','AGE','PTGENDER','APOE4']
+    feats = [f for f in core_feats if f in df.columns] + dti_cols
+    
+    df[feats] = RobustScaler().fit_transform(df[feats])
+    
+    X, Y = [], []
+    for rid in df["RID"].unique():
+        p = df[df["RID"]==rid]
+        if len(p) < 5: continue
+        X.append(p[feats].values[-12-4:-4] if len(p)>16 else np.pad(p[feats].values[:-4], ((12-len(p[:-4]),0),(0,0)), 'constant'))
+        Y.append([p['DX_num'].iloc[-4], p['DX_num'].iloc[-3], p['DX_num'].iloc[-2], p['DX_num'].iloc[-1]])
+    
+    X, Y = np.array(X), np.array(Y).astype(np.int64)
+    skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=SEED)
+    
+    all_metrics = []
+    
+    with PdfPages('Master_Research_Report.pdf') as pdf:
+        for fold, (train_idx, test_idx) in enumerate(skf.split(X, Y[:, 0])):
+            print(f"🚀 Processing Fold {fold+1}/5...")
+            X_tr, X_te = X[train_idx], X[test_idx]
+            Y_tr, Y_te = Y[train_idx], Y[test_idx]
+            
+            model = BrainSovereign_Master(len(feats)).to(device)
+            optimizer = optim.AdamW(model.parameters(), lr=1e-4, weight_decay=0.01)
+            
+            # تدريب مكثف (100 Epochs كما في الكود الثاني)
+            for epoch in range(1, 101):
+                model.train()
+                for i in range(0, len(X_tr), 32):
+                    optimizer.zero_grad()
+                    x_b = torch.tensor(X_tr[i:i+32], dtype=torch.float32).to(device)
+                    y_b = torch.tensor(Y_tr[i:i+32], dtype=torch.long).to(device)
+                    outs, _ = model(x_b)
+                    loss = sum([F.cross_entropy(outs[j], y_b[:, j], label_smoothing=0.1) for j in range(4)])
+                    loss.backward(); optimizer.step()
+
+            model.eval()
+            with torch.no_grad():
+                p_te, emb_te = model(torch.tensor(X_te, dtype=torch.float32).to(device))
+                p_tr, emb_tr = model(torch.tensor(X_tr, dtype=torch.float32).to(device))
+
+            fold_stats = []
+            for i in range(4): # لكل فترة زمنية
+                xgb_mod = xgb.XGBClassifier(n_estimators=300, learning_rate=0.03, random_state=SEED).fit(emb_tr.cpu().numpy(), Y_tr[:, i])
+                
+                # Meta-Fusion المتطور
+                m_tr = np.hstack([F.softmax(p_tr[i], dim=1).cpu().numpy(), xgb_mod.predict_proba(emb_tr.cpu().numpy())])
+                m_te = np.hstack([F.softmax(p_te[i], dim=1).cpu().numpy(), xgb_mod.predict_proba(emb_te.cpu().numpy())])
+                
+                meta_nn = DeepMetaFusion(m_tr.shape[1]).to(device)
+                m_opt = optim.Adam(meta_nn.parameters(), lr=0.001)
+                for _ in range(100):
+                    m_opt.zero_grad()
+                    F.cross_entropy(meta_nn(torch.tensor(m_tr, dtype=torch.float32).to(device)), 
+                                    torch.tensor(Y_tr[:, i], dtype=torch.long).to(device)).backward()
+                    m_opt.step()
+                
+                probs = F.softmax(meta_nn(torch.tensor(m_te, dtype=torch.float32).to(device)), dim=1).cpu().detach().numpy()
+                y_pred = np.argmax(probs, axis=1)
+                
+                # حساب كل المقاييس
+                fold_stats.append({
+                    'Acc': accuracy_score(Y_te[:, i], y_pred),
+                    'B_Acc': balanced_accuracy_score(Y_te[:, i], y_pred),
+                    'F1': f1_score(Y_te[:, i], y_pred, average='weighted'),
+                    'AUC': roc_auc_score(label_binarize(Y_te[:, i], classes=[0, 1, 2]), probs, multi_class='ovr')
+                })
+
+                if fold == 0:
+                    plt.figure(figsize=(5,4))
+                    sns.heatmap(confusion_matrix(Y_te[:, i], y_pred), annot=True, fmt='d', cmap='Blues')
+                    plt.title(f"Fold 1 - Confusion Matrix {i}")
+                    pdf.savefig(); plt.close()
+
+            all_metrics.append(fold_stats)
+
+        # SHAP للـ Biomarkers الأصلية (تحليل نهائي)
+        print("📊 Analyzing Feature Importance (Original Biomarkers)...")
+        explainer_model = xgb.XGBClassifier().fit(X.mean(axis=1), Y[:, 3])
+        explainer = shap.TreeExplainer(explainer_model)
+        shap_values = explainer.shap_values(X.mean(axis=1))
+        plt.figure(); shap.summary_plot(shap_values, X.mean(axis=1), feature_names=feats, show=False)
+        pdf.savefig(); plt.close()
+
+    # تجميع التقارير النهائية
+    horizons = ["Present", "12M", "24M", "36M"]
+    final_report = []
+    for i in range(4):
+        final_report.append({
+            'Horizon': horizons[i],
+            'Mean_Accuracy (%)': np.mean([f[i]['Acc'] for f in all_metrics]) * 100,
+            'Mean_F1-Score': np.mean([f[i]['F1'] for f in all_metrics]),
+            'Mean_ROC-AUC': np.mean([f[i]['AUC'] for f in all_metrics])
+        })
+
+    df_final = pd.DataFrame(final_report)
+    df_final.to_excel("ADNI_Final_Master_Results.xlsx", index=False)
+    print("\n✅ PROCESS COMPLETED. Results and Analysis Ready!")
+    print(df_final)
+    files.download('ADNI_Final_Master_Results.xlsx')
+    files.download('Master_Research_Report.pdf')
+
+run_master_system("ADNI_Final_Clean_Ready.csv")
