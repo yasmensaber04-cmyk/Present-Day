@@ -1,0 +1,202 @@
+import torch, pandas as pd, numpy as np, xgboost as xgb, warnings, gc, os
+import torch.nn as nn, torch.nn.functional as F
+import torch.optim as optim
+from torch_geometric.nn import GATv2Conv, GraphNorm
+from sklearn.preprocessing import RobustScaler
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score, confusion_matrix
+import matplotlib.pyplot as plt
+import seaborn as sns
+import shap
+from matplotlib.backends.backend_pdf import PdfPages
+
+# ==================== ⚙️ الإعدادات العامة ====================
+warnings.filterwarnings("ignore")
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+SEED = 42; np.random.seed(SEED); torch.manual_seed(SEED)
+gc.collect(); torch.cuda.empty_cache()
+
+# ==================== 1️⃣ الهياكل العصبية (Architecture) ====================
+
+class DeepMetaFusion(nn.Module):
+    def __init__(self, input_dim):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, 128),
+            nn.BatchNorm1d(128),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(128, 64),
+            nn.ReLU(),
+            nn.Linear(64, 3)
+        )
+    def forward(self, x): return self.net(x)
+
+class BrainSovereign_Final(nn.Module):
+    def __init__(self, input_dim, hidden=512, n_layers=6):
+        super().__init__()
+        self.gnn = GATv2Conv(input_dim, hidden // 4, heads=4, dropout=0.4)
+        self.gnn_norm = GraphNorm(hidden)
+        self.lstm = nn.LSTM(hidden, hidden // 2, bidirectional=True, batch_first=True, dropout=0.4)
+        encoder_layer = nn.TransformerEncoderLayer(d_model=hidden, nhead=8, dim_feedforward=2048, batch_first=True, dropout=0.4)
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
+        self.heads = nn.ModuleList([nn.Linear(hidden, 3) for _ in range(4)])
+
+    def forward(self, x):
+        batch_size, seq_len, _ = x.shape
+        edge_index = self.get_realistic_connectivity(x).to(device)
+        x_flat = x.view(batch_size * seq_len, -1)
+        x_gnn = self.gnn(x_flat, edge_index)
+        x_gnn = self.gnn_norm(x_gnn).view(batch_size, seq_len, -1)
+        x_lstm, _ = self.lstm(x_gnn)
+        x_trans = self.transformer(x_lstm)
+        context = torch.mean(x_trans, dim=1)
+        return [head(context) for head in self.heads], context
+
+    def get_realistic_connectivity(self, x):
+        with torch.no_grad():
+            corr_matrix = torch.corrcoef(x.mean(dim=0).t())
+            adj = (torch.abs(corr_matrix) > 0.75).float() 
+            return adj.nonzero().t().contiguous()
+
+# ==================== 2️⃣ معالجة البيانات (Data Engine) ====================
+
+def prepare_data(path, seq_len=12):
+    print("📦 Phase 1: Processing Data & Global Resampling...")
+    if not os.path.exists(path): raise FileNotFoundError(f"الملف {path} غير موجود.")
+    
+    df = pd.read_csv(path).sort_values(['RID','Years_bl']).fillna(0)
+    dti_cols = [c for c in df.columns if 'DTI' in c]
+    feats = ['MMSE','ADAS13','CDRSB','FAQ','Hippocampus','WholeBrain'] + dti_cols
+    df[feats] = RobustScaler().fit_transform(df[feats])
+    
+    X, Y = [], []
+    for rid in df["RID"].unique():
+        p = df[df["RID"]==rid]
+        if len(p) < 5: continue
+        x_raw = p[feats].values
+        X.append(np.pad(x_raw[:-4], ((seq_len-len(x_raw[:-4]), 0), (0,0)), mode='edge') if len(x_raw[:-4])<seq_len else x_raw[-seq_len-4:-4])
+        Y.append([p['DX_num'].iloc[-4], p['DX_num'].iloc[-3], p['DX_num'].iloc[-2], p['DX_num'].iloc[-1]])
+    
+    X, Y = np.array(X), np.array(Y).astype(int)
+    # تقنية موازنة البيانات (Global Resampling)
+    from sklearn.utils import resample
+    X_f, Y_f = [], []
+    for cv in np.unique(Y[:, 0]):
+        xf, yf = resample(X[Y[:,0]==cv], Y[Y[:,0]==cv], n_samples=min(pd.Series(Y[:, 0]).value_counts().max(), 500), random_state=SEED)
+        X_f.append(xf); Y_f.append(yf)
+    
+    return train_test_split(np.vstack(X_f), np.vstack(Y_f), test_size=0.15, random_state=SEED), feats
+
+# ==================== 3️⃣ التشغيل والحفظ والتحليل (The Master) ====================
+
+def run_ultimate_system_with_overfit_alert(path):
+    (X_tr_full, X_te, Y_tr_full, Y_te), f_cols = prepare_data(path)
+    X_train, X_val, Y_train, Y_val = train_test_split(X_tr_full, Y_tr_full, test_size=0.15, random_state=SEED)
+    
+    model = BrainSovereign_Final(len(f_cols)).to(device)
+    optimizer = optim.AdamW(model.parameters(), lr=1e-4, weight_decay=0.01)
+    
+    train_losses, val_losses = [], []
+    best_val_loss, patience, trigger_times = float('inf'), 12, 0
+
+    print("🚀 Step 2: Training with Real-time Overfitting Monitor...")
+    
+
+    for epoch in range(1, 151):
+        model.train()
+        optimizer.zero_grad()
+        x_t, y_t = torch.tensor(X_train, dtype=torch.float32).to(device), torch.tensor(Y_train).to(device)
+        outs, _ = model(x_t)
+        loss_train = sum([F.cross_entropy(outs[j], y_t[:,j], label_smoothing=0.1) for j in range(4)])
+        loss_train.backward(); optimizer.step()
+        train_losses.append(loss_train.item())
+
+        model.eval()
+        with torch.no_grad():
+            x_v, y_v = torch.tensor(X_val, dtype=torch.float32).to(device), torch.tensor(Y_val).to(device)
+            v_outs, _ = model(x_v)
+            loss_val = sum([F.cross_entropy(v_outs[j], y_v[:,j]) for j in range(4)])
+            val_losses.append(loss_val.item())
+
+        if epoch % 10 == 0:
+            print(f"Epoch {epoch:03d} | Train Loss: {loss_train:.4f} | Val Loss: {loss_val:.4f}")
+
+        if loss_val < best_val_loss:
+            best_val_loss = loss_val
+            torch.save(model.state_dict(), 'best_neuro_model.pth')
+            trigger_times = 0
+        else:
+            trigger_times += 1
+            if trigger_times >= patience:
+                print(f"⛔ Early Stopping triggered at epoch {epoch}"); break
+
+    model.load_state_dict(torch.load('best_neuro_model.pth'))
+    model.eval()
+    with torch.no_grad():
+        p_outs, emb_te = model(torch.tensor(X_te, dtype=torch.float32).to(device))
+        p_outs_tr, emb_tr = model(torch.tensor(X_tr_full, dtype=torch.float32).to(device))
+
+    horizons = ["Present", "12 Months", "24 Months", "36 Months"]
+    final_stats = []
+
+    with PdfPages('Research_Visual_Report.pdf') as pdf:
+        # رسم منحنى التعلم
+        plt.figure(figsize=(8, 5))
+        plt.plot(train_losses, label='Train Loss', color='blue'); plt.plot(val_losses, label='Val Loss', color='red', ls='--')
+        plt.title("Overfitting Check: Learning Curves"); plt.legend(); plt.grid(True); pdf.savefig(); plt.close()
+
+        print("\n🚀 Step 3: Meta-Fusion & Benchmarking...")
+        for i, name in enumerate(horizons):
+            # موديل XGBoost
+            xgb_mod = xgb.XGBClassifier(n_estimators=300, random_state=SEED).fit(emb_tr.cpu().numpy(), Y_tr_full[:,i])
+            y_xgb = xgb_mod.predict(emb_te.cpu().numpy())
+            
+            # موديل GNN المنفرد للتحقق من الفجوة
+            y_gnn_train = np.argmax(p_outs_tr[i].cpu().numpy(), axis=1)
+            y_gnn_val = np.argmax(p_outs[i].cpu().numpy(), axis=1)
+            
+            # Meta-Fusion
+            m_tr = np.hstack([F.softmax(p_outs_tr[i], dim=1).cpu().numpy(), xgb_mod.predict_proba(emb_tr.cpu().numpy())])
+            m_te = np.hstack([F.softmax(p_outs[i], dim=1).cpu().numpy(), xgb_mod.predict_proba(emb_te.cpu().numpy())])
+            meta_nn = DeepMetaFusion(m_tr.shape[1]).to(device)
+            m_opt = optim.Adam(meta_nn.parameters(), lr=0.01)
+            for _ in range(100):
+                m_opt.zero_grad()
+                F.cross_entropy(meta_nn(torch.tensor(m_tr, dtype=torch.float32).to(device)), torch.tensor(Y_tr_full[:,i]).to(device)).backward()
+                m_opt.step()
+            
+            y_fusion = torch.argmax(meta_nn(torch.tensor(m_te, dtype=torch.float32).to(device)), dim=1).cpu().numpy()
+
+            # حساب تنبيه الـ Overfitting (الفجوة بين التدريب والاختبار)
+            train_acc = accuracy_score(Y_tr_full[:,i], y_gnn_train)
+            val_acc = accuracy_score(Y_te[:,i], y_gnn_val)
+            gap = train_acc - val_acc
+            status = "✔ Healthy Generalization" if gap < 0.10 else "⚠ Potential Overfit"
+            print(f"{status} on {name} | Gap: {gap:.2f}")
+
+            final_stats.append({
+                'Horizon': name, 'GNN_Acc': val_acc*100, 
+                'XGB_Acc': accuracy_score(Y_te[:, i], y_xgb)*100, 
+                'Fusion_Acc': accuracy_score(Y_te[:, i], y_fusion)*100
+            })
+
+            # Confusion Matrix
+            plt.figure(figsize=(6, 5))
+            sns.heatmap(confusion_matrix(Y_te[:, i], y_fusion), annot=True, fmt='d', cmap='Purples', 
+                        xticklabels=['CN','MCI','AD'], yticklabels=['CN','MCI','AD'])
+            plt.title(f"Confusion Matrix: {name} (Final Fusion)"); pdf.savefig(); plt.close()
+
+        # الرسم البياني النهائي للمقارنة
+        df_results = pd.DataFrame(final_stats)
+        plt.figure(figsize=(10, 6))
+        plt.plot(df_results['Horizon'], df_results['Fusion_Acc'], label='Proposed Fusion', marker='s', lw=3, color='red')
+        plt.plot(df_results['Horizon'], df_results['GNN_Acc'], label='GNN Alone', marker='o', ls='--')
+        plt.title("Comparative Accuracy Over Time Horizons"); plt.ylabel("Accuracy %"); plt.legend(); plt.grid(True)
+        pdf.savefig(); plt.close()
+
+    df_results.to_excel("ADNI_Final_Benchmarking.xlsx", index=False)
+    print("\n✅ PROCESS COMPLETED. Files saved."); print(df_results[['Horizon', 'Fusion_Acc']])
+
+# تشغيل النظام
+run_ultimate_system_with_overfit_alert("ADNI_Final_Clean_Ready.csv")
